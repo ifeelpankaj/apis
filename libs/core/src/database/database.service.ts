@@ -1,12 +1,20 @@
 import {
   Injectable,
-  Logger,
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
 import { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
-import { DatabaseConfig } from './database.config';
+import { AppConfigService } from '../config/config.service.js';
+import { DatabaseConfig } from '../config/config.interface.js';
+import { AppLogger } from '../logger/logger.service.js';
+import {
+  HealthCheckResult,
+  PoolStats,
+  ReadinessResult,
+  TransactionOptions,
+  TransactionWork,
+  TRANSIENT_TX_ERROR_CODES,
+} from './database.types.js';
 
 interface QueryMetrics {
   text: string;
@@ -14,19 +22,25 @@ interface QueryMetrics {
   rowCount: number;
 }
 
+interface PostgresErrorLike {
+  code?: string;
+}
+
 @Injectable()
 export class DatabaseService implements OnModuleInit, OnModuleDestroy {
-  private readonly logger = new Logger(DatabaseService.name);
+  private readonly logger: AppLogger;
   private readonly pool: Pool;
+  private readonly config: DatabaseConfig;
   private isShuttingDown = false;
+  private inFlightOperations = 0;
 
-  constructor(private readonly configService: ConfigService) {
-    const config = this.configService.get<DatabaseConfig>('database');
-    if (!config) {
-      throw new Error(
-        'Database configuration not found. Did you register database.config.ts with ConfigModule?',
-      );
-    }
+  constructor(
+    appConfig: AppConfigService,
+    appLogger: AppLogger,
+  ) {
+    const config = appConfig.database;
+    this.config = config;
+    this.logger = appLogger.forContext('DatabaseService');
 
     this.pool = new Pool({
       host: config.host,
@@ -40,84 +54,132 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
       idleTimeoutMillis: config.idleTimeoutMillis,
       connectionTimeoutMillis: config.connectionTimeoutMillis,
       statement_timeout: config.statementTimeoutMillis,
+      maxLifetimeSeconds: config.maxLifetimeSeconds,
+      keepAlive: config.keepAlive,
+      keepAliveInitialDelayMillis: config.keepAliveInitialDelayMillis,
+      allowExitOnIdle: config.allowExitOnIdle,
+      ...(config.maxUses !== undefined ? { maxUses: config.maxUses } : {}),
 
       ssl: config.ssl,
-      application_name: process.env.SERVICE_NAME ?? 'nestjs-app',
+      application_name: config.serviceName,
     });
 
-    // REQUIRED: pg emits 'error' on idle clients that die in the background
-    // (dropped connection, DB restart, etc). Without this listener, that
-    // error is unhandled and crashes the whole process.
     this.pool.on('error', (err) => {
       this.logger.error(
         `Unexpected error on idle Postgres client: ${err.message}`,
-        err.stack,
+        err,
       );
     });
 
     this.pool.on('connect', () =>
       this.logger.debug('New client connected to pool'),
     );
-    this.pool.on('remove', () => this.logger.debug('Client removed from pool'));
+    this.pool.on('remove', () =>
+      this.logger.debug('Client removed from pool'),
+    );
   }
 
   async onModuleInit(): Promise<void> {
-    await this.healthCheck();
+    await this.connectWithRetry();
     this.logger.log(
-      `Postgres pool ready (max=${this.pool.options.max}, min=${
-        (this.pool.options as { min?: number }).min ?? 0
-      })`,
+      `Postgres pool ready (max=${this.config.max}, min=${this.config.min}, ` +
+        `idleTimeout=${this.config.idleTimeoutMillis}ms, ` +
+        `maxLifetime=${this.config.maxLifetimeSeconds}s)`,
     );
   }
 
   async onModuleDestroy(): Promise<void> {
     this.isShuttingDown = true;
     this.logger.log('Draining Postgres pool...');
+
+    const deadline = Date.now() + this.config.drainTimeoutMs;
+    while (this.inFlightOperations > 0 && Date.now() < deadline) {
+      await this.sleep(100);
+    }
+
+    if (this.inFlightOperations > 0) {
+      this.logger.warn(
+        `Drain timeout reached with ${this.inFlightOperations} in-flight operation(s); closing pool`,
+      );
+    }
+
     await this.pool.end();
     this.logger.log('Postgres pool closed');
   }
 
+  get shuttingDown(): boolean {
+    return this.isShuttingDown;
+  }
+
   /**
-   * Raw pool handle for pgtyped-generated query functions, which accept a
-   * `Pool | PoolClient` as their second argument, e.g.:
-   *   findUserById.run({ id }, this.db.getPool())
+   * Raw pool handle for pgtyped-generated query functions.
+   * Never log connection strings or passwords.
    */
   getPool(): Pool {
-    if (this.isShuttingDown) {
-      throw new Error('Database pool is shutting down; rejecting new work');
-    }
+    this.assertAcceptingWork();
     return this.pool;
   }
 
-  /** Used at startup and by the /health/db endpoint. */
-  async healthCheck(): Promise<{ ok: true; latencyMs: number }> {
+  async healthCheck(): Promise<HealthCheckResult> {
+    this.assertAcceptingWork();
     const start = process.hrtime.bigint();
     await this.pool.query('SELECT 1');
     return { ok: true, latencyMs: this.elapsedMs(start) };
   }
 
-  /** Snapshot of pool saturation — wire this into your metrics exporter. */
-  getPoolStats() {
+  getPoolStats(): PoolStats {
     return {
       totalCount: this.pool.totalCount,
       idleCount: this.pool.idleCount,
       waitingCount: this.pool.waitingCount,
+      max: this.config.max,
     };
   }
 
-  /**
-   * Instrumented ad hoc query helper (timing + slow-query logging).
-   * pgtyped-generated functions call `pool.query` themselves and don't go
-   * through this — use this for one-off queries at the repository layer
-   * that aren't worth generating a .sql file for.
-   *
-   * Always parameterized: pass values via `params`, never interpolate
-   * into `text`.
-   */
+  isPoolSaturated(): boolean {
+    const stats = this.getPoolStats();
+    if (stats.max <= 0) return false;
+    return stats.waitingCount / stats.max > this.config.poolSaturationThreshold;
+  }
+
+  async checkReadiness(): Promise<ReadinessResult> {
+    const pool = this.getPoolStats();
+    const saturated = this.isPoolSaturated();
+    const shuttingDown = this.isShuttingDown;
+
+    if (shuttingDown || saturated) {
+      return {
+        ready: false,
+        db: {
+          ok: false,
+          error: shuttingDown ? 'shutting_down' : 'pool_saturated',
+        },
+        pool,
+        saturated,
+        shuttingDown,
+      };
+    }
+
+    try {
+      const db = await this.healthCheck();
+      return { ready: true, db, pool, saturated: false, shuttingDown: false };
+    } catch (err) {
+      return {
+        ready: false,
+        db: { ok: false, error: (err as Error).message },
+        pool,
+        saturated,
+        shuttingDown,
+      };
+    }
+  }
+
   async query<T extends QueryResultRow = QueryResultRow>(
     text: string,
     params?: unknown[],
   ): Promise<QueryResult<T>> {
+    this.assertAcceptingWork();
+    this.inFlightOperations++;
     const start = process.hrtime.bigint();
     try {
       const result = await this.pool.query<T>(text, params as unknown[]);
@@ -130,43 +192,139 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     } catch (err) {
       this.logger.error(
         `Query failed after ${this.elapsedMs(start).toFixed(1)}ms: ${text}`,
-        (err as Error).stack,
+        err as Error,
       );
+      throw err;
+    } finally {
+      this.inFlightOperations--;
+    }
+  }
+
+  async withTransaction<T>(
+    work: TransactionWork<T>,
+    options: TransactionOptions = {},
+  ): Promise<T> {
+    this.assertAcceptingWork();
+
+    const maxRetries = options.maxRetries ?? this.config.txMaxRetries;
+    const retryDelayMs = options.retryDelayMs ?? 100;
+    const txName = options.name ?? 'anonymous';
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await this.runTransaction(work, options);
+      } catch (err) {
+        const code = (err as PostgresErrorLike).code;
+        const isTransient =
+          code !== undefined && TRANSIENT_TX_ERROR_CODES.has(code);
+
+        if (!isTransient || attempt >= maxRetries) {
+          throw err;
+        }
+
+        const delay = retryDelayMs * Math.pow(2, attempt);
+        this.logger.warn(
+          `Transaction "${txName}" retry ${attempt + 1}/${maxRetries} ` +
+            `after ${code} in ${delay}ms`,
+        );
+        await this.sleep(delay);
+      }
+    }
+
+    throw new Error(`Transaction "${txName}" failed after retries`);
+  }
+
+  async withSavepoint<T>(
+    client: PoolClient,
+    name: string,
+    work: (client: PoolClient) => Promise<T>,
+  ): Promise<T> {
+    const savepoint = `sp_${name.replace(/[^a-zA-Z0-9_]/g, '_')}`;
+    await client.query(`SAVEPOINT ${savepoint}`);
+    try {
+      const result = await work(client);
+      await client.query(`RELEASE SAVEPOINT ${savepoint}`);
+      return result;
+    } catch (err) {
+      await client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
       throw err;
     }
   }
 
-  /**
-   * Runs `work` inside a transaction on a single checked-out client.
-   * Commits on success, rolls back on any thrown error, always releases
-   * the client back to the pool.
-   *
-   * Pass `client` into your pgtyped `.run()` calls inside `work` so every
-   * query in the callback shares the same transaction.
-   */
-  async withTransaction<T>(
-    work: (client: PoolClient) => Promise<T>,
+  private async runTransaction<T>(
+    work: TransactionWork<T>,
+    options: TransactionOptions,
   ): Promise<T> {
+    this.inFlightOperations++;
     const client = await this.pool.connect();
     const start = process.hrtime.bigint();
+    const txName = options.name ?? 'anonymous';
+
     try {
-      await client.query('BEGIN');
+      await client.query(this.buildBeginStatement(options));
       const result = await work(client);
       await client.query('COMMIT');
       this.logger.debug(
-        `Transaction committed in ${this.elapsedMs(start).toFixed(1)}ms`,
+        `Transaction "${txName}" committed in ${this.elapsedMs(start).toFixed(1)}ms`,
       );
       return result;
     } catch (err) {
       await client.query('ROLLBACK');
       this.logger.warn(
-        `Transaction rolled back after ${this.elapsedMs(start).toFixed(1)}ms: ${
-          (err as Error).message
-        }`,
+        `Transaction "${txName}" rolled back after ${this.elapsedMs(start).toFixed(1)}ms: ${(err as Error).message}`,
       );
       throw err;
     } finally {
       client.release();
+      this.inFlightOperations--;
+    }
+  }
+
+  private buildBeginStatement(options: TransactionOptions): string {
+    const parts = ['BEGIN'];
+    if (options.isolationLevel) {
+      parts.push('ISOLATION LEVEL', options.isolationLevel);
+    }
+    if (options.readOnly) {
+      parts.push('READ ONLY');
+    }
+    if (options.deferrable) {
+      parts.push('DEFERRABLE');
+    }
+    return parts.join(' ');
+  }
+
+  private async connectWithRetry(): Promise<void> {
+    const { startupRetries, startupRetryDelayMs } = this.config;
+    let lastError: Error | undefined;
+
+    for (let attempt = 0; attempt <= startupRetries; attempt++) {
+      try {
+        await this.healthCheck();
+        if (attempt > 0) {
+          this.logger.log(`Postgres connected on retry attempt ${attempt}`);
+        }
+        return;
+      } catch (err) {
+        lastError = err as Error;
+        if (attempt < startupRetries) {
+          this.logger.warn(
+            `Postgres connection attempt ${attempt + 1} failed: ${lastError.message}. ` +
+              `Retrying in ${startupRetryDelayMs}ms...`,
+          );
+          await this.sleep(startupRetryDelayMs);
+        }
+      }
+    }
+
+    throw new Error(
+      `Failed to connect to Postgres after ${startupRetries + 1} attempt(s): ${lastError?.message}`,
+    );
+  }
+
+  private assertAcceptingWork(): void {
+    if (this.isShuttingDown) {
+      throw new Error('Database pool is shutting down; rejecting new work');
     }
   }
 
@@ -174,14 +332,15 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     return Number(process.hrtime.bigint() - startNs) / 1e6;
   }
 
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
   private logQuery(metrics: QueryMetrics): void {
     const { text, durationMs, rowCount } = metrics;
-    const slowMs = Number(process.env.DB_SLOW_QUERY_MS ?? 200);
-    const message = `query="${this.truncate(text)}" duration=${durationMs.toFixed(
-      1,
-    )}ms rows=${rowCount}`;
+    const message = `query="${this.truncate(text)}" duration=${durationMs.toFixed(1)}ms rows=${rowCount}`;
 
-    if (durationMs >= slowMs) {
+    if (durationMs >= this.config.slowQueryMs) {
       this.logger.warn(`SLOW QUERY ${message}`);
     } else {
       this.logger.debug(message);

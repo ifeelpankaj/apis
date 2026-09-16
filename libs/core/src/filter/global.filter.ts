@@ -9,6 +9,7 @@ import { randomUUID } from 'crypto';
 import { Request, Response } from 'express';
 import { ZodError } from 'zod';
 
+import { AppConfigService } from '../config/config.service.js';
 import { AppLogger } from '../logger/logger.service.js';
 import {
   ErrorResponse,
@@ -132,9 +133,12 @@ export class GlobalExceptionFilter implements ExceptionFilter {
   private readonly scopedLogger: AppLogger;
   private readonly isProduction: boolean;
 
-  constructor(private readonly logger: AppLogger) {
+  constructor(
+    private readonly logger: AppLogger,
+    appConfig: AppConfigService,
+  ) {
     this.scopedLogger = this.logger.forContext('HTTP');
-    this.isProduction = process.env.NODE_ENV === 'production';
+    this.isProduction = appConfig.isProduction;
   }
 
   catch(exception: unknown, host: ArgumentsHost): void {

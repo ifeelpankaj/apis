@@ -4,7 +4,7 @@ import { DatabaseModule } from './database/database.module.js';
 import { LoggerModule } from './logger/logger.module.js';
 
 @Module({
-  imports: [ConfigModule, DatabaseModule, LoggerModule],
-  exports: [ConfigModule, DatabaseModule, LoggerModule],
+  imports: [ConfigModule, LoggerModule, DatabaseModule],
+  exports: [ConfigModule, LoggerModule, DatabaseModule],
 })
 export class CoreModule {}

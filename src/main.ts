@@ -1,5 +1,6 @@
 import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module.js';
 import cookieParser from 'cookie-parser';
 import { AppLogger } from '@app/core/logger/logger.service.js';
@@ -8,7 +9,8 @@ import { GlobalExceptionFilter } from '@app/core/filter/global.filter.js';
 import { ResponseInterceptor } from '@app/core/interceptor/response.interceptor.js';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create(AppModule, { rawBody: true });
+  app.enableShutdownHooks();
 
   // Logger
   const logger = app.get(AppLogger);
@@ -39,6 +41,28 @@ async function bootstrap() {
     },
   });
 
+  if (!configService.isProduction) {
+    const swaggerPath = 'swagger';
+    const swaggerConfig = new DocumentBuilder()
+      .setTitle('Cab Management API')
+      .setDescription('Cab management system API')
+      .setVersion('1.0')
+      .addCookieAuth('access_token')
+      .addCookieAuth('refresh_token')
+      .addBearerAuth()
+      .build();
+    const document = SwaggerModule.createDocument(app, swaggerConfig);
+    SwaggerModule.setup(swaggerPath, app, document, {
+      useGlobalPrefix: true,
+      jsonDocumentUrl: 'swagger-json',
+    });
+
+    const httpAdapter = app.getHttpAdapter();
+    httpAdapter.get(`/${swaggerPath}`, (_req: unknown, res: { redirect: (url: string) => void }) => {
+      res.redirect(`/${globalPrefix}/${swaggerPath}`);
+    });
+  }
+
   // Global Pipes
   app.useGlobalPipes(
     new ValidationPipe({
@@ -52,7 +76,7 @@ async function bootstrap() {
   );
 
   // Global filters and interceptors
-  app.useGlobalFilters(new GlobalExceptionFilter(logger));
+  app.useGlobalFilters(new GlobalExceptionFilter(logger, configService));
   app.useGlobalInterceptors(new ResponseInterceptor(configService, logger));
   const port = configService.appConfig.port;
   const host = configService.appConfig.host;
@@ -61,6 +85,11 @@ async function bootstrap() {
   logger.log(
     `✓ Application is running on: http://localhost:${port}/${globalPrefix}`,
   );
+  if (!configService.isProduction) {
+    logger.log(
+      `✓ Swagger docs: http://localhost:${port}/${globalPrefix}/swagger`,
+    );
+  }
 }
 
 bootstrap();
